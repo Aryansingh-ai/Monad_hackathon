@@ -5,6 +5,8 @@ const { ethers } = require("ethers");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const Database = require("better-sqlite3");
+const proof = require("../sdk/proof");
 
 const app = express();
 
@@ -19,8 +21,28 @@ const RPC_URL = process.env.RPC_URL;
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
 
-const ML_LOG_FILE =
-  "D:\\DaanDristi-Monad_folder\\Monad_hackathon\\logs\\inference.jsonl";
+const ML_LOG_FILE = path.join(
+  __dirname,
+  "..",
+  "..",
+  "Monad_hackathon",
+  "logs",
+  "inference.jsonl"
+);
+
+// Structured source of truth for accepted AI events.
+// (inference.jsonl above is now audit-only for the API.)
+const SQLITE_FILE =
+  process.env.SQLITE_FILE
+    ? path.resolve(__dirname, process.env.SQLITE_FILE)
+    : path.join(
+        __dirname,
+        "..",
+        "..",
+        "Monad_hackathon",
+        "sqlite",
+        "donation_box.db"
+      );
 
 
 // ======================================================
@@ -118,117 +140,162 @@ app.use((req, res, next) => {
 
 
 // ======================================================
-// CREATE EXACT SAME HASH AS ML
+// CREATE LEGACY RAW-RECORD HASH
 // ======================================================
+//
+// Hash of the raw ML record (JSONL-shaped). Every proof
+// registered BEFORE canonical AI events used this, and
+// blockchain.py still sends it as a lookup key.
+//
+// The algorithm lives in the SDK so the canonical event's
+// recordHash and this function can never drift apart.
+//
 
 function createProofHash(record) {
 
-  const canonicalData =
-    JSON.stringify(
-      Object.keys(record)
-        .sort()
-        .reduce((obj, key) => {
+  return proof.hashLegacyRecord(record);
 
-          obj[key] = record[key];
+}
 
-          return obj;
 
-        }, {})
+// ======================================================
+// READ DONATIONS FROM SQLITE (PRIMARY SOURCE OF TRUTH)
+// ======================================================
+//
+// Monad_hackathon/sqlite/donation_box.db is the structured
+// source for accepted AI events. inference.jsonl stays as the
+// audit stream written by live_camera.py; the API no longer
+// reads it.
+//
+// Every row is returned as:
+//
+//   lineNumber : donations.id (name kept so the dashboard's
+//                "recordNumber" keeps working)
+//   donation   : the raw SQLite row
+//   record     : legacy JSONL-shaped record rebuilt from the
+//                row (dashboard compatibility + legacy hash)
+//
+
+function openDonationDatabase() {
+
+  if (!fs.existsSync(SQLITE_FILE)) {
+
+    throw new Error(
+      `SQLite database not found: ${SQLITE_FILE}`
     );
 
-  return (
-    "0x" +
-    crypto
-      .createHash("sha256")
-      .update(
-        canonicalData,
-        "utf8"
-      )
-      .digest("hex")
+  }
+
+  return new Database(
+    SQLITE_FILE,
+    {
+      readonly: true,
+      fileMustExist: true,
+      timeout: 5000
+    }
   );
 
 }
 
 
-// ======================================================
-// READ ALL ML RECORDS
-// ======================================================
+function toDonationItem(donation) {
 
-function getAllMLRecords() {
+  return {
 
-  if (!fs.existsSync(ML_LOG_FILE)) {
+    lineNumber:
+      donation.id,
 
-    throw new Error(
-      `ML log file not found: ${ML_LOG_FILE}`
-    );
+    donation,
 
-  }
+    record:
+      proof.donationToLegacyRecord(
+        donation
+      )
 
-  const content =
-    fs.readFileSync(
-      ML_LOG_FILE,
-      "utf8"
-    );
-
-  const lines =
-    content
-      .split(/\r?\n/)
-      .filter(
-        line => line.trim() !== ""
-      );
-
-  const records = [];
-
-  for (let i = 0; i < lines.length; i++) {
-
-    try {
-
-      const record =
-        JSON.parse(lines[i]);
-
-      records.push({
-
-        lineNumber: i + 1,
-
-        record
-
-      });
-
-    } catch (error) {
-
-      console.warn(
-        `Skipping invalid JSON at line ${i + 1}`
-      );
-
-    }
-
-  }
-
-  return records;
+  };
 
 }
 
 
-// ======================================================
-// READ LATEST ML RECORD
-// ======================================================
+function getAllDonationRecords() {
 
-function getLatestMLRecord() {
+  const db =
+    openDonationDatabase();
 
-  const records =
-    getAllMLRecords();
+  try {
 
-  if (records.length === 0) {
+    return db
+      .prepare(
+        "SELECT * FROM donations ORDER BY id ASC"
+      )
+      .all()
+      .map(toDonationItem);
 
-    throw new Error(
-      "ML log file is empty"
-    );
+  } finally {
+
+    db.close();
 
   }
 
-  return records[
-    records.length - 1
-  ].record;
+}
+
+
+function getLatestDonationRecord() {
+
+  const db =
+    openDonationDatabase();
+
+  try {
+
+    const row =
+      db
+        .prepare(
+          "SELECT * FROM donations ORDER BY id DESC LIMIT 1"
+        )
+        .get();
+
+    if (!row) {
+
+      throw new Error(
+        "SQLite donations table is empty"
+      );
+
+    }
+
+    return toDonationItem(row);
+
+  } finally {
+
+    db.close();
+
+  }
+
+}
+
+
+function getDonationById(donationId) {
+
+  const db =
+    openDonationDatabase();
+
+  try {
+
+    const row =
+      db
+        .prepare(
+          "SELECT * FROM donations WHERE donation_id = ?"
+        )
+        .get(donationId);
+
+    return row
+      ? toDonationItem(row)
+      : null;
+
+  } finally {
+
+    db.close();
+
+  }
 
 }
 
@@ -317,33 +384,53 @@ function createRecordId(record) {
 
 
 // ======================================================
-// FIND RECORD BY PROOF HASH
+// FIND DONATION FOR REGISTRATION
 // ======================================================
+//
+// Resolves the SQLite row a /register-proof request refers to.
+//
+//   1. donationId  (exact, preferred: sent by blockchain.py)
+//   2. proofHash   (legacy raw-record hash, old clients)
+//
 
-function findMLRecordByHash(proofHash) {
+function findDonationForRegistration({
+  donationId,
+  proofHash
+}) {
 
-  const allRecords =
-    getAllMLRecords();
+  if (donationId) {
 
-  for (const item of allRecords) {
-
-    if (
-      item.record.decision !== "ACCEPT"
-    ) {
-      continue;
-    }
-
-    const calculatedHash =
-      createProofHash(
-        item.record
+    const item =
+      getDonationById(
+        donationId
       );
 
-    if (
-      calculatedHash.toLowerCase() ===
-      proofHash.toLowerCase()
+    if (item) {
+
+      return item;
+
+    }
+
+  }
+
+  if (proofHash) {
+
+    const wanted =
+      proofHash.toLowerCase();
+
+    for (
+      const item of getAllDonationRecords()
     ) {
 
-      return item.record;
+      if (
+        createProofHash(
+          item.record
+        ).toLowerCase() === wanted
+      ) {
+
+        return item;
+
+      }
 
     }
 
@@ -358,7 +445,7 @@ function findMLRecordByHash(proofHash) {
 // SAVE ORIGINAL RECORD
 // ======================================================
 
-function saveOriginalRecord(record, proofHash, blockchainInfo) {
+function saveOriginalRecord(record, proofHash, blockchainInfo, proofInfo) {
 
   const records =
     readOriginalRecords();
@@ -378,6 +465,22 @@ function saveOriginalRecord(record, proofHash, blockchainInfo) {
     recordId,
 
     proofHash,
+
+    // Which hashing scheme proofHash used, and the frozen
+    // provenance (issuer/device/model/modelHash) at registration
+    // time. Verification re-uses it so a later model swap or config
+    // change cannot make an untouched record look tampered.
+    proofScheme:
+      proofInfo?.proofScheme || proof.PROOF_SCHEME_LEGACY,
+
+    legacyProofHash:
+      proofInfo?.legacyProofHash || null,
+
+    provenance:
+      proofInfo?.provenance || null,
+
+    canonicalEvent:
+      proofInfo?.canonicalEvent || null,
 
     sourceId:
       record.pocket_id || "unknown",
@@ -551,6 +654,188 @@ async function findProofTransaction(
 
 
 // ======================================================
+// VERIFY A DONATION ON-CHAIN (CANONICAL + LEGACY)
+// ======================================================
+//
+// Two hashes can represent one SQLite row:
+//
+//   canonical : SHA-256 of the canonical AI event (new)
+//   legacy    : SHA-256 of the raw ML record     (old)
+//
+// New registrations use canonical. Proofs already on Monad
+// from before this change used legacy, so we try canonical
+// first and fall back to legacy. If neither exists on-chain
+// the caller decides NOT_REGISTERED vs TAMPERED exactly as
+// before.
+//
+// Provenance for the canonical event comes from the original
+// snapshot (frozen at registration). Rows with no snapshot use
+// the current config + current model file hash.
+//
+
+let canonicalUnavailableWarned = false;
+
+
+function buildProofCandidates(item, originalSnapshot) {
+
+  const legacyHash =
+    createProofHash(
+      item.record
+    );
+
+  let canonicalEvent = null;
+
+  let canonicalHash = null;
+
+  try {
+
+    const provenance =
+      originalSnapshot?.provenance ||
+      proof.getCurrentProvenance();
+
+    canonicalEvent =
+      proof.createCanonicalAIEvent(
+        item.donation,
+        provenance
+      );
+
+    canonicalHash =
+      proof.hashAIEvent(
+        canonicalEvent
+      );
+
+  } catch (error) {
+
+    if (!canonicalUnavailableWarned) {
+
+      canonicalUnavailableWarned = true;
+
+      console.warn(
+        "Canonical proof unavailable, using legacy hash only:",
+        error.message
+      );
+
+    }
+
+  }
+
+  return {
+
+    legacyHash,
+
+    canonicalEvent,
+
+    canonicalHash
+
+  };
+
+}
+
+
+async function verifyDonationOnChain(
+  item,
+  originalSnapshot
+) {
+
+  const {
+    legacyHash,
+    canonicalEvent,
+    canonicalHash
+  } = buildProofCandidates(
+    item,
+    originalSnapshot
+  );
+
+
+  let canonicalResult = null;
+
+  if (canonicalHash) {
+
+    canonicalResult =
+      await contract.verifyProof(
+        canonicalHash
+      );
+
+    if (canonicalResult[0]) {
+
+      return {
+
+        exists: true,
+
+        proofHash: canonicalHash,
+
+        proofScheme:
+          proof.PROOF_SCHEME_CANONICAL,
+
+        blockchainResult:
+          canonicalResult,
+
+        canonicalEvent,
+
+        legacyHash
+
+      };
+
+    }
+
+  }
+
+
+  const legacyResult =
+    await contract.verifyProof(
+      legacyHash
+    );
+
+  if (legacyResult[0]) {
+
+    return {
+
+      exists: true,
+
+      proofHash: legacyHash,
+
+      proofScheme:
+        proof.PROOF_SCHEME_LEGACY,
+
+      blockchainResult:
+        legacyResult,
+
+      canonicalEvent,
+
+      legacyHash
+
+    };
+
+  }
+
+
+  // Not on-chain under either hash.
+  // Report the preferred (canonical) CURRENT hash.
+  return {
+
+    exists: false,
+
+    proofHash:
+      canonicalHash || legacyHash,
+
+    proofScheme:
+      canonicalHash
+        ? proof.PROOF_SCHEME_CANONICAL
+        : proof.PROOF_SCHEME_LEGACY,
+
+    blockchainResult:
+      canonicalResult || legacyResult,
+
+    canonicalEvent,
+
+    legacyHash
+
+  };
+
+}
+
+
+// ======================================================
 // HOME
 // ======================================================
 
@@ -565,7 +850,10 @@ app.get("/", (req, res) => {
       "running",
 
     originalRegistry:
-      ORIGINAL_RECORDS_FILE
+      ORIGINAL_RECORDS_FILE,
+
+    donationDatabase:
+      SQLITE_FILE
 
   });
 
@@ -575,6 +863,19 @@ app.get("/", (req, res) => {
 // ======================================================
 // REGISTER BLOCKCHAIN PROOF
 // ======================================================
+//
+// Accepts:
+//   { donationId, sourceId }            (blockchain.py, preferred)
+//   { proofHash,  sourceId }            (legacy clients)
+//   { donationId, proofHash, sourceId } (blockchain.py sends both)
+//
+// When the SQLite row is found, the hash registered on Monad is
+// the CANONICAL AI event hash, not the raw-record hash the client
+// sent. The response `proofHash` is the hash actually registered.
+//
+// When the row cannot be found, behavior falls back to the old
+// flow: register the client-supplied hash as-is.
+//
 
 app.post(
   "/register-proof",
@@ -584,13 +885,14 @@ app.post(
 
       const {
         proofHash,
-        sourceId
+        sourceId,
+        donationId
       } = req.body;
 
 
       if (
-        !proofHash ||
-        !sourceId
+        !sourceId ||
+        (!proofHash && !donationId)
       ) {
 
         return res.status(400).json({
@@ -599,7 +901,7 @@ app.post(
             false,
 
           error:
-            "proofHash and sourceId are required"
+            "sourceId and either proofHash or donationId are required"
 
         });
 
@@ -621,8 +923,13 @@ app.post(
       );
 
       console.log(
-        "Proof Hash:",
-        proofHash
+        "Client proof hash:",
+        proofHash || "(none)"
+      );
+
+      console.log(
+        "Donation ID:",
+        donationId || "(none)"
       );
 
       console.log(
@@ -632,24 +939,93 @@ app.post(
 
 
       // ------------------------------------------------
-      // Find the exact ML record corresponding to hash
+      // Find the exact SQLite row for this request
       // ------------------------------------------------
 
-      const originalRecord =
-        findMLRecordByHash(
+      const item =
+        findDonationForRegistration({
+          donationId,
           proofHash
+        });
+
+
+      let registerHash;
+
+      let proofScheme;
+
+      let provenance = null;
+
+      let canonicalEvent = null;
+
+      let legacyProofHash =
+        proofHash || null;
+
+
+      if (item) {
+
+        // Throws if the model file cannot be read:
+        // we never register a fake modelHash.
+        provenance =
+          proof.getCurrentProvenance();
+
+        canonicalEvent =
+          proof.createCanonicalAIEvent(
+            item.donation,
+            provenance
+          );
+
+        registerHash =
+          proof.hashAIEvent(
+            canonicalEvent
+          );
+
+        proofScheme =
+          proof.PROOF_SCHEME_CANONICAL;
+
+        legacyProofHash =
+          createProofHash(
+            item.record
+          );
+
+        console.log(
+          "Event ID:",
+          canonicalEvent.eventId
         );
 
+        console.log(
+          "Canonical proof hash:",
+          registerHash
+        );
 
-      if (!originalRecord) {
+      } else {
+
+        if (!proofHash) {
+
+          return res.status(404).json({
+
+            success:
+              false,
+
+            error:
+              "donationId not found in SQLite database"
+
+          });
+
+        }
 
         console.warn(
-          "WARNING: Could not find matching ML record."
+          "WARNING: Could not find matching SQLite record."
         );
 
         console.warn(
-          "Blockchain registration will continue."
+          "Registering the client-supplied hash as-is."
         );
+
+        registerHash =
+          proofHash;
+
+        proofScheme =
+          proof.PROOF_SCHEME_LEGACY;
 
       }
 
@@ -660,7 +1036,7 @@ app.post(
 
       const tx =
         await contract.registerProof(
-          proofHash,
+          registerHash,
           sourceId
         );
 
@@ -695,17 +1071,26 @@ app.post(
       // AUTOMATICALLY SAVE ORIGINAL SNAPSHOT
       // ------------------------------------------------
 
-      if (originalRecord) {
+      if (item) {
 
         saveOriginalRecord(
-          originalRecord,
-          proofHash,
+          item.record,
+          registerHash,
           {
             transactionHash:
               tx.hash,
 
             blockNumber:
               receipt.blockNumber
+          },
+          {
+            proofScheme,
+
+            legacyProofHash,
+
+            provenance,
+
+            canonicalEvent
           }
         );
 
@@ -725,7 +1110,15 @@ app.post(
 
         explorerUrl,
 
-        proofHash,
+        proofHash:
+          registerHash,
+
+        proofScheme,
+
+        legacyProofHash,
+
+        eventId:
+          canonicalEvent?.eventId || null,
 
         sourceId
 
@@ -872,7 +1265,7 @@ app.get(
 
 
 // ======================================================
-// GET LATEST ML RECORD
+// GET LATEST ACCEPTED RECORD (SQLITE)
 // ======================================================
 
 app.get(
@@ -881,8 +1274,11 @@ app.get(
 
     try {
 
+      const item =
+        getLatestDonationRecord();
+
       const record =
-        getLatestMLRecord();
+        item.record;
 
 
       if (
@@ -912,16 +1308,23 @@ app.get(
       }
 
 
-      const proofHash =
-        createProofHash(
+      const originalSnapshot =
+        findOriginalSnapshot(
           record
         );
 
 
-      const blockchainResult =
-        await contract.verifyProof(
-          proofHash
+      const verification =
+        await verifyDonationOnChain(
+          item,
+          originalSnapshot
         );
+
+      const proofHash =
+        verification.proofHash;
+
+      const blockchainResult =
+        verification.blockchainResult;
 
 
       let transactionInfo =
@@ -938,12 +1341,6 @@ app.get(
           );
 
       }
-
-
-      const originalSnapshot =
-        findOriginalSnapshot(
-          record
-        );
 
 
       let status;
@@ -973,9 +1370,16 @@ app.get(
 
         record,
 
+        // Canonical AI provenance event for this row
+        event:
+          verification.canonicalEvent,
+
         blockchain: {
 
           proofHash,
+
+          proofScheme:
+            verification.proofScheme,
 
           exists:
             blockchainResult[0],
@@ -1050,29 +1454,80 @@ app.get(
 // ⭐ VERIFY ALL ACCEPTED RECORDS
 // ======================================================
 
+// ------------------------------------------------------
+// Console summary de-duplication
+// ------------------------------------------------------
+//
+// /all-records is polled repeatedly by the dashboard.
+// The verification itself still runs on every request,
+// but the console summary is only printed the first time
+// and whenever Total / Verified / Tampered / Not registered
+// changes.
+//
+
+let lastPrintedSummaryKey = null;
+
+function printVerificationSummaryIfChanged(
+  total,
+  verified,
+  tampered,
+  notRegistered
+) {
+
+  const summaryKey =
+    `${total}|${verified}|${tampered}|${notRegistered}`;
+
+  if (summaryKey === lastPrintedSummaryKey) {
+    return;
+  }
+
+  lastPrintedSummaryKey = summaryKey;
+
+  console.log();
+
+  console.log(
+    "=========================================="
+  );
+
+  console.log(
+    "VERIFYING ALL DONATION RECORDS"
+  );
+
+  console.log(
+    "=========================================="
+  );
+
+  console.log(
+    "Total:",
+    total
+  );
+
+  console.log(
+    "Verified:",
+    verified
+  );
+
+  console.log(
+    "Tampered:",
+    tampered
+  );
+
+  console.log(
+    "Not registered:",
+    notRegistered
+  );
+
+}
+
+
 app.get(
   "/all-records",
   async (req, res) => {
 
     try {
 
-      console.log();
-
-      console.log(
-        "=========================================="
-      );
-
-      console.log(
-        "VERIFYING ALL DONATION RECORDS"
-      );
-
-      console.log(
-        "=========================================="
-      );
-
-
       const allRecords =
-        getAllMLRecords();
+        getAllDonationRecords();
 
 
       const results = [];
@@ -1098,37 +1553,35 @@ app.get(
 
 
         // ----------------------------------------------
-        // Calculate current hash
-        // ----------------------------------------------
-
-        const currentHash =
-          createProofHash(
-            record
-          );
-
-
-        // ----------------------------------------------
-        // Ask Monad whether CURRENT hash exists
-        // ----------------------------------------------
-
-        const blockchainResult =
-          await contract.verifyProof(
-            currentHash
-          );
-
-
-        const exists =
-          blockchainResult[0];
-
-
-        // ----------------------------------------------
-        // Find original snapshot
+        // Find original snapshot (holds frozen provenance)
         // ----------------------------------------------
 
         const originalSnapshot =
           findOriginalSnapshot(
             record
           );
+
+
+        // ----------------------------------------------
+        // Ask Monad whether the CURRENT canonical proof
+        // hash exists. Falls back to the legacy raw-record
+        // hash for proofs registered before canonical events.
+        // ----------------------------------------------
+
+        const verification =
+          await verifyDonationOnChain(
+            item,
+            originalSnapshot
+          );
+
+        const currentHash =
+          verification.proofHash;
+
+        const blockchainResult =
+          verification.blockchainResult;
+
+        const exists =
+          verification.exists;
 
 
         // ----------------------------------------------
@@ -1252,6 +1705,12 @@ app.get(
           proofHash:
             currentHash,
 
+          proofScheme:
+            verification.proofScheme,
+
+          eventId:
+            item.donation.donation_id,
+
 
           // Original information
           originalDenomination,
@@ -1329,23 +1788,10 @@ app.get(
         ).length;
 
 
-      console.log(
-        "Total:",
-        results.length
-      );
-
-      console.log(
-        "Verified:",
-        verifiedRecords
-      );
-
-      console.log(
-        "Tampered:",
-        tamperedRecords
-      );
-
-      console.log(
-        "Not registered:",
+      printVerificationSummaryIfChanged(
+        results.length,
+        verifiedRecords,
+        tamperedRecords,
         notRegisteredRecords
       );
 
@@ -1479,9 +1925,48 @@ app.listen(
     );
 
     console.log(
-      "ML Log:",
+      "SQLite (source of truth):",
+      SQLITE_FILE
+    );
+
+    console.log(
+      "ML Log (audit only):",
       ML_LOG_FILE
     );
+
+    try {
+
+      const provenance =
+        proof.getCurrentProvenance();
+
+      console.log(
+        "Issuer:",
+        provenance.issuer
+      );
+
+      console.log(
+        "Device ID:",
+        provenance.deviceId
+      );
+
+      console.log(
+        "Model ID:",
+        provenance.modelId
+      );
+
+      console.log(
+        "Model hash:",
+        provenance.modelHash
+      );
+
+    } catch (error) {
+
+      console.warn(
+        "Provenance unavailable:",
+        error.message
+      );
+
+    }
 
     console.log(
       "Original Registry:",
