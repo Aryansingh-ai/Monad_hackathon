@@ -1563,47 +1563,54 @@ app.get(
 
 
         // ----------------------------------------------
-        // Ask Monad whether the CURRENT canonical proof
-        // hash exists. Falls back to the legacy raw-record
-        // hash for proofs registered before canonical events.
+        // Calculate current hash LOCALLY (No RPC)
         // ----------------------------------------------
 
-        const verification =
-          await verifyDonationOnChain(
-            item,
-            originalSnapshot
-          );
+        const {
+          legacyHash,
+          canonicalEvent,
+          canonicalHash
+        } = buildProofCandidates(
+          item,
+          originalSnapshot
+        );
 
         const currentHash =
-          verification.proofHash;
+          canonicalHash || legacyHash;
 
-        const blockchainResult =
-          verification.blockchainResult;
-
-        const exists =
-          verification.exists;
+        const proofScheme =
+          canonicalHash
+            ? proof.PROOF_SCHEME_CANONICAL
+            : proof.PROOF_SCHEME_LEGACY;
 
 
         // ----------------------------------------------
-        // Determine status
+        // Determine status locally
         // ----------------------------------------------
 
         let status;
+        let exists = false;
 
-        if (exists) {
+        if (!originalSnapshot) {
+
+          status =
+            "NOT_REGISTERED";
+
+        } else if (
+          originalSnapshot.proofHash.toLowerCase() === currentHash.toLowerCase() ||
+          (originalSnapshot.proofHash.toLowerCase() === legacyHash.toLowerCase())
+        ) {
 
           status =
             "VERIFIED";
 
-        } else if (originalSnapshot) {
-
-          status =
-            "TAMPERED";
+          exists =
+            true;
 
         } else {
 
           status =
-            "NOT_REGISTERED";
+            "TAMPERED";
 
         }
 
@@ -1705,8 +1712,7 @@ app.get(
           proofHash:
             currentHash,
 
-          proofScheme:
-            verification.proofScheme,
+          proofScheme,
 
           eventId:
             item.donation.donation_id,
@@ -1732,15 +1738,17 @@ app.get(
           tamperDetails,
 
 
-          // Blockchain information
+          // Blockchain information (from snapshot instead of RPC)
           sourceId:
-            blockchainResult[1],
+            originalSnapshot?.sourceId ||
+            null,
 
           timestamp:
-            blockchainResult[2].toString(),
+            originalSnapshot?.registeredAt ||
+            null,
 
           registeredBy:
-            blockchainResult[3],
+            null, // Only available via direct RPC lookup
 
           transactionHash:
             originalSnapshot?.transactionHash ||
@@ -1892,8 +1900,10 @@ app.get(
 
 const PORT = 3000;
 
-app.listen(
-  PORT,
+const server = app.listen(PORT);
+
+server.on(
+  "listening",
   () => {
 
     console.log();
@@ -1959,11 +1969,11 @@ app.listen(
         provenance.modelHash
       );
 
-    } catch (error) {
+    } catch (err) {
 
       console.warn(
         "Provenance unavailable:",
-        error.message
+        err.message
       );
 
     }
@@ -1978,6 +1988,34 @@ app.listen(
     );
 
     console.log();
+
+  }
+);
+
+server.on(
+  "error",
+  (err) => {
+
+    if (err.code === "EADDRINUSE") {
+
+      console.error(
+        `\nFATAL: Port ${PORT} is already in use.`
+      );
+
+      console.error(
+        `Stop the existing process and try again.\n`
+      );
+
+    } else {
+
+      console.error(
+        "Server error:",
+        err.message
+      );
+
+    }
+
+    process.exit(1);
 
   }
 );
