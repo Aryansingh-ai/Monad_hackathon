@@ -114,6 +114,102 @@ const contract =
 
 
 // ======================================================
+// ENVIO HYPERINDEX — READ-ONLY QUERY LAYER
+// ======================================================
+//
+// Envio indexes ProofRegistered and IssuerStatusChanged
+// events from the deployed contract on Monad Testnet.
+//
+// USAGE:
+//   - findProofTransaction() queries Envio first (O(1)).
+//     Falls back to the old getLogs scan only when Envio
+//     returns null (proof too recent / indexer lag).
+//   - /verify-proof/:hash continues to call contract.verifyProof()
+//     for authoritative existence. Envio supplies the tx metadata.
+//   - /all-records is NOT changed: still uses local hash compare,
+//     still makes ZERO per-record RPC calls.
+//   - Envio is never used for cryptographic tamper detection.
+//
+// CONFIGURATION (optional — set ENVIO_GRAPHQL_URL in .env):
+//   Default: http://localhost:8080  (local Envio dev instance)
+//   Cloud:   set ENVIO_GRAPHQL_URL to your deployed Envio endpoint
+//
+// When ENVIO_GRAPHQL_URL is not set or Envio is unreachable,
+// the API falls back transparently to the getLogs scan.
+//
+
+const ENVIO_GRAPHQL_URL =
+  process.env.ENVIO_GRAPHQL_URL ||
+  "http://localhost:8080";
+
+
+// -------------------------------------------------------
+// queryEnvioProof(proofHash)
+// -------------------------------------------------------
+// Queries the Envio indexer for a RegisteredProof by its
+// proofHash. Returns { txHash, blockNumber } or null.
+//
+// Never throws — Envio is optional infrastructure.
+// Any error (network, indexer down, hash not yet indexed)
+// returns null so the caller can fall back to getLogs.
+//
+async function queryEnvioProof(proofHash) {
+
+  try {
+
+    // Normalise: Envio stores the id as the proofHash string
+    // exactly as it was emitted (0x-prefixed hex).
+    const id = proofHash.toLowerCase();
+
+    const query = `
+      query GetProof($id: String!) {
+        RegisteredProof_by_pk(id: $id) {
+          id
+          txHash
+          blockNumber
+          blockTimestamp
+          sourceId
+          registeredBy
+        }
+      }
+    `;
+
+    const response = await fetch(
+      `${ENVIO_GRAPHQL_URL}/v1/graphql`,
+      {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ query, variables: { id } }),
+        signal:  AbortSignal.timeout(4000)
+      }
+    );
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const json = await response.json();
+
+    const record = json?.data?.RegisteredProof_by_pk;
+
+    if (!record || !record.txHash) {
+      return null;
+    }
+
+    return {
+      txHash:      record.txHash,
+      blockNumber: Number(record.blockNumber)
+    };
+
+  } catch {
+    // Envio unavailable / timeout / parse error — fall through to getLogs
+    return null;
+  }
+
+}
+
+
+// ======================================================
 // CORS
 // ======================================================
 
@@ -578,10 +674,57 @@ function findOriginalSnapshot(record) {
 // ======================================================
 // FIND TRANSACTION FOR PROOF
 // ======================================================
+//
+// Strategy:
+//   1. Try Envio first — O(1) indexed GraphQL lookup, no RPC.
+//   2. If Envio returns null (proof not yet indexed, indexer
+//      behind by a few blocks, or Envio unavailable), fall back
+//      to the original getLogs scan over the last 200k blocks.
+//
+// This replaces a raw 200k-block getLogs scan with an instant
+// GraphQL query, while preserving identical behaviour for callers.
+//
+// /all-records does NOT call this function — it uses local hash
+// comparison exclusively and makes zero RPC calls.
+//
 
 async function findProofTransaction(
   proofHash
 ) {
+
+  // ----------------------------------------------------------
+  // Step 1: Try Envio (O(1), no RPC)
+  // ----------------------------------------------------------
+
+  const envioResult =
+    await queryEnvioProof(proofHash);
+
+  if (envioResult) {
+
+    return {
+
+      transactionHash:
+        envioResult.txHash,
+
+      blockNumber:
+        envioResult.blockNumber,
+
+      explorerUrl:
+        `https://testnet.monadexplorer.com/tx/${envioResult.txHash}`,
+
+      source:
+        "envio"
+
+    };
+
+  }
+
+
+  // ----------------------------------------------------------
+  // Step 2: RPC fallback — getLogs scan (original behaviour)
+  // Used when Envio is unavailable or the proof is too recent
+  // to have been indexed yet.
+  // ----------------------------------------------------------
 
   try {
 
@@ -635,7 +778,10 @@ async function findProofTransaction(
         latestMatchingLog.blockNumber,
 
       explorerUrl:
-        `https://testnet.monadexplorer.com/tx/${latestMatchingLog.transactionHash}`
+        `https://testnet.monadexplorer.com/tx/${latestMatchingLog.transactionHash}`,
+
+      source:
+        "rpc-fallback"
 
     };
 
@@ -1885,6 +2031,177 @@ app.get(
 
         error:
           error.message
+
+      });
+
+    }
+
+  }
+);
+
+
+// ======================================================
+// PROOF HISTORY (ENVIO-POWERED)
+// ======================================================
+//
+// Returns paginated proof history from the Envio indexer.
+//
+// Query params:
+//   limit  (default 20, max 100)
+//   offset (default 0)
+//
+// This endpoint is additive — it does not change any existing
+// endpoint behaviour. If Envio is unavailable, it returns a
+// clear error with instructions.
+//
+// Note: this is HISTORY data from the event log, not
+// authoritative on-chain state. For proof existence, use
+// /verify-proof/:hash which calls contract.verifyProof().
+//
+
+app.get(
+  "/proof-history",
+  async (req, res) => {
+
+    try {
+
+      const limit =
+        Math.min(
+          parseInt(req.query.limit) || 20,
+          100
+        );
+
+      const offset =
+        parseInt(req.query.offset) || 0;
+
+
+      const query = `
+        query ProofHistory($limit: Int!, $offset: Int!) {
+          RegisteredProof(
+            order_by: { blockNumber: desc }
+            limit: $limit
+            offset: $offset
+          ) {
+            id
+            proofHash
+            sourceId
+            registeredBy
+            blockTimestamp
+            blockNumber
+            txHash
+          }
+        }
+      `;
+
+
+      const response =
+        await fetch(
+          `${ENVIO_GRAPHQL_URL}/v1/graphql`,
+          {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify({
+              query,
+              variables: { limit, offset }
+            }),
+            signal: AbortSignal.timeout(6000)
+          }
+        );
+
+
+      if (!response.ok) {
+
+        return res.status(503).json({
+
+          success: false,
+
+          error:
+            "Envio indexer unavailable",
+
+          hint:
+            `Start the indexer: cd dpp-monad/envio && pnpm dev. ` +
+            `Or set ENVIO_GRAPHQL_URL to your deployed Envio endpoint.`
+
+        });
+
+      }
+
+
+      const json =
+        await response.json();
+
+
+      if (json.errors) {
+
+        return res.status(502).json({
+
+          success: false,
+
+          error:
+            "Envio GraphQL error",
+
+          details:
+            json.errors
+
+        });
+
+      }
+
+
+      const records =
+        (json?.data?.RegisteredProof || []).map(
+          (r) => ({
+            proofHash:      r.proofHash,
+            sourceId:       r.sourceId,
+            registeredBy:   r.registeredBy,
+            blockTimestamp: r.blockTimestamp.toString(),
+            blockNumber:    r.blockNumber.toString(),
+            txHash:         r.txHash,
+            explorerUrl:
+              `https://testnet.monadexplorer.com/tx/${r.txHash}`
+          })
+        );
+
+
+      res.json({
+
+        success: true,
+
+        count:   records.length,
+
+        limit,
+
+        offset,
+
+        envioUrl:
+          ENVIO_GRAPHQL_URL,
+
+        note:
+          "History from Envio event index. " +
+          "For authoritative proof existence use /verify-proof/:hash.",
+
+        records
+
+      });
+
+
+    } catch (error) {
+
+      const isTimeout =
+        error.name === "TimeoutError" ||
+        error.message.includes("timeout");
+
+      res.status(isTimeout ? 504 : 503).json({
+
+        success: false,
+
+        error: isTimeout
+          ? "Envio indexer timed out"
+          : "Envio indexer unreachable",
+
+        hint:
+          `Start the indexer: cd dpp-monad/envio && pnpm dev. ` +
+          `Or set ENVIO_GRAPHQL_URL in .env to your deployed endpoint.`
 
       });
 
