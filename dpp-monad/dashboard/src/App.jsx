@@ -146,6 +146,155 @@ function TamperCard({ r, i }) {
   );
 }
 
+/* ---------- envio proof analytics & explorer ---------- */
+function ProofAnalytics() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/proof-analytics`);
+      if (!res.ok) throw new Error("Unavailable");
+      const json = await res.json();
+      if (!json.success) throw new Error(json.error);
+      setData(json);
+      setError(null);
+    } catch (err) {
+      setError("On-chain analytics temporarily unavailable.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, []);
+
+  if (loading && !data) return null;
+  if (error) return <div className="panel muted" style={{ marginTop: '2rem' }}><AlertTriangle size={14}/> {error}</div>;
+
+  return (
+    <section className="analytics panel" style={{ marginTop: '2rem', padding: '2rem' }}>
+      <div className="sec-head row">
+        <div>
+          <h2>On-Chain Analytics</h2>
+          <span className="muted">Global HyperIndex Statistics</span>
+        </div>
+        {data.latestProcessedBlock && (
+          <span className="pill" style={{ fontSize: '0.8rem', background: 'var(--bg-sub)' }}>
+            <span style={{ color: 'var(--ok)' }}>●</span> Synced to block {data.latestProcessedBlock}
+          </span>
+        )}
+      </div>
+      <div className="numbers" style={{ justifyContent: 'flex-start', gap: '3rem', marginTop: '1.5rem', flexWrap: 'wrap' }}>
+        <div className="stat">
+          <strong>{data.total}{data.isPartial ? '+' : ''}</strong>
+          <span>Total Indexed Proofs</span>
+        </div>
+        {Object.entries(data.byIssuer || {}).map(([issuer, count]) => (
+          <div className="stat" key={issuer}>
+            <strong>{count}{data.isPartial ? '+' : ''}</strong>
+            <span>Proofs by Issuer ({clip(issuer)})</span>
+          </div>
+        ))}
+      </div>
+      {data.isPartial && (
+        <div className="muted" style={{ marginTop: '1.5rem', fontSize: '0.85rem' }}>
+          * Displaying aggregated results for the most recent 10,000 proofs.
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ProofExplorer() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/proof-history?limit=10`);
+      if (!res.ok) throw new Error("Unavailable");
+      const json = await res.json();
+      if (!json.success) throw new Error(json.error);
+      setData(json.records || []);
+      setError(null);
+    } catch (err) {
+      setError("On-chain history temporarily unavailable; indexer synchronization may be interrupted.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, []);
+
+  if (loading && !data) return <div className="muted" style={{ padding: '2rem' }}>Loading Explorer...</div>;
+  
+  if (error) {
+    return (
+      <section className="explorer" style={{ marginTop: '3rem', padding: '2rem', border: '1px solid var(--border)', borderRadius: '8px' }}>
+        <div className="sec-head row">
+          <div>
+            <h2>On-Chain Proof Explorer</h2>
+            <span className="muted">Live Envio HyperIndex Feed</span>
+          </div>
+          <button className="btn" onClick={load}><RefreshCw size={12} /> Retry</button>
+        </div>
+        <div className="verdict bad" style={{ marginTop: '1rem', padding: '1rem' }}>
+          <span className="v-icon"><AlertTriangle size={20} /></span>
+          <div>
+            <strong>INDEXER OFFLINE</strong>
+            <span>{error}</span>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="explorer" style={{ marginTop: '3rem', paddingTop: '2rem' }}>
+      <div className="sec-head row">
+        <div>
+          <h2>On-Chain Proof Explorer</h2>
+          <span className="muted">Live Envio HyperIndex Feed</span>
+        </div>
+        <button className="btn" onClick={load}><RefreshCw size={12} /> Refresh Feed</button>
+      </div>
+      
+      {data.length === 0 ? (
+        <p className="muted">No proofs indexed yet.</p>
+      ) : (
+        <div className="tgrid" style={{ marginTop: '1rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+          {data.map((r) => (
+            <article key={r.proofHash} className="tcard" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '1rem', alignItems: 'center', padding: '1rem 1.5rem' }}>
+              <div>
+                <small>Proof Hash</small>
+                <code style={{display:'block'}}>{clip(r.proofHash)}</code>
+              </div>
+              <div>
+                <small>Source ID</small>
+                <strong>{r.sourceId}</strong>
+              </div>
+              <div>
+                <small>Block</small>
+                <strong>#{r.blockNumber}</strong>
+                <div className="muted" style={{ fontSize: '0.75rem' }}>{new Date(Number(r.blockTimestamp) * 1000).toLocaleString([], {dateStyle:'short', timeStyle:'short'})}</div>
+              </div>
+              <div style={{ textAlign: 'right' }}>
+                <a className="tx" href={r.explorerUrl} target="_blank" rel="noopener noreferrer">
+                  View Tx <ExternalLink size={14} />
+                </a>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 const STEPS = [
   [Cpu, "Model scans", "ML screens each record for anomalies"],
   [Hash, "SHA-256", "The record becomes a fixed fingerprint"],
@@ -323,6 +472,9 @@ export default function App() {
         )}
 
         <Insights total={total} verified={verified} tampered={tampered} pct={pct} />
+
+        <ProofAnalytics />
+        <ProofExplorer />
 
         <section className="flow" aria-label="How verification works">
           <div className="track"><i className="particle" /></div>

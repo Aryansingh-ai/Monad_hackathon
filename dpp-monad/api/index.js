@@ -2059,6 +2059,104 @@ app.get(
 // /verify-proof/:hash which calls contract.verifyProof().
 //
 
+// ======================================================
+// PROOF ANALYTICS (ENVIO-POWERED)
+// ======================================================
+
+app.get(
+  "/proof-analytics",
+  async (req, res) => {
+    try {
+      let offset = 0;
+      const limit = 1000;
+      let allRecords = [];
+      let latestProcessedBlock = null;
+
+      while (true) {
+        const query = `
+          query GetAnalytics($limit: Int!, $offset: Int!) {
+            chain_metadata {
+              latest_processed_block
+            }
+            RegisteredProof(limit: $limit, offset: $offset) {
+              registeredBy
+              blockTimestamp
+            }
+          }
+        `;
+
+        const response = await fetch(`${ENVIO_GRAPHQL_URL}/v1/graphql`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, variables: { limit, offset } }),
+          signal: AbortSignal.timeout(6000)
+        });
+
+        if (!response.ok) {
+          return res.status(503).json({
+            success: false,
+            error: "Envio indexer unavailable"
+          });
+        }
+
+        const json = await response.json();
+        if (json.errors) {
+          return res.status(502).json({
+            success: false,
+            error: "Envio GraphQL error",
+            details: json.errors
+          });
+        }
+
+        if (offset === 0 && json?.data?.chain_metadata?.[0]) {
+          latestProcessedBlock = json.data.chain_metadata[0].latest_processed_block;
+        }
+
+        const records = json?.data?.RegisteredProof || [];
+        allRecords.push(...records);
+
+        // Stop if we got less than limit (end of data) or hit hard cap of 10k
+        if (records.length < limit || allRecords.length >= 10000) {
+          break;
+        }
+        offset += limit;
+      }
+
+      const total = allRecords.length;
+      const isPartial = allRecords.length >= 10000;
+      
+      const byIssuer = {};
+      const byDate = {};
+
+      for (const r of allRecords) {
+        const issuer = r.registeredBy;
+        byIssuer[issuer] = (byIssuer[issuer] || 0) + 1;
+        
+        const ts = Number(r.blockTimestamp) * 1000;
+        const date = new Date(ts).toISOString().split('T')[0];
+        byDate[date] = (byDate[date] || 0) + 1;
+      }
+
+      res.json({
+        success: true,
+        total,
+        isPartial,
+        byIssuer,
+        byDate,
+        latestProcessedBlock,
+        envioUrl: ENVIO_GRAPHQL_URL
+      });
+
+    } catch (error) {
+      const isTimeout = error.name === "TimeoutError" || error.message.includes("timeout");
+      res.status(isTimeout ? 504 : 503).json({
+        success: false,
+        error: isTimeout ? "Envio indexer timed out" : "Envio indexer unreachable"
+      });
+    }
+  }
+);
+
 app.get(
   "/proof-history",
   async (req, res) => {
