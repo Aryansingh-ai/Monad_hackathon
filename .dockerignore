@@ -1,0 +1,16 @@
+.git
+.github
+node_modules
+**/node_modules
+dpp-monad/dashboard/dist
+dpp-monad/dashboard/node_modules
+dpp-monad/envio
+venv
+.venv
+__pycache__
+*.pyc
+.env
+.env.local
+.env.*
+!.env.example
+*.log
