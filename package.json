@@ -1,0 +1,11 @@
+{
+  "name": "daandrishti-deployment",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": "20.x"
+  },
+  "scripts": {
+    "start": "node dpp-monad/api/index.js"
+  }
+}
