@@ -30,12 +30,12 @@ requests>=2.31.0
 
 
 
-cd .\dpp-monad\api
-node index.js
+# cd .\dpp-monad\api
+# node index.js
 
-cd .\Monad_hackathon
-..\.venv\Scripts\python.exe .\scripts\live_camera.py
+# cd .\Monad_hackathon
+# ..\.venv\Scripts\python.exe .\scripts\live_camera.py
 
-cd .\dpp-monad\dashboard
-npm run dev
+# cd .\dpp-monad\dashboard
+# npm run dev
 
